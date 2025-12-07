@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
 
-from llm_client import BaseLLMClient
-from stats import Stats
-from prompts import build_code_system_prompt, build_user_prompt_for_string
+from core.llm_client import BaseLLMClient
+from core.stats import Stats
+from core.prompts import build_code_system_prompt, build_user_prompt_for_string
 
 
 def is_i18n_key_like(s: str) -> bool:
