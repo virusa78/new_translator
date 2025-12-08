@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any
 
@@ -9,29 +10,20 @@ import requests  # type: ignore
 
 from .errors import ExceedContextSizeError
 
+logger = logging.getLogger("translator.llm")
+
 
 @dataclass
 class BaseLLMClient:
-    """
-    Базовый интерфейс для всех LLM-клиентов.
-    Все реализации обязаны иметь метод:
-        translate(system_prompt, user_prompt) -> (text, dt_seconds)
-    """
-
     def translate(self, system_prompt: str, user_prompt: str) -> Tuple[str, float]:
         raise NotImplementedError
 
 
 @dataclass
 class LlamaCppClient(BaseLLMClient):
-    """
-    Клиент для llama.cpp (llama-server) с OpenAI-совместимым API:
-    POST /v1/chat/completions
-    """
-
     url: str
     model: str
-    timeout: int = 600
+    timeout: int = 60  # меньше, чтобы не висело на минутами
 
     def translate(self, system_prompt: str, user_prompt: str) -> Tuple[str, float]:
         payload: Dict[str, Any] = {
@@ -43,13 +35,20 @@ class LlamaCppClient(BaseLLMClient):
             "temperature": 0.0,
         }
 
+        logger.info(
+            f"[LLM] llama.cpp call → {self.url} model={self.model}, "
+            f"user_prompt_len={len(user_prompt)}"
+        )
+
         t0 = time.time()
         resp = requests.post(self.url, json=payload, timeout=self.timeout)
         t1 = time.time()
 
+        dt = t1 - t0
         text_body = resp.text
 
-        # Специальная обработка переполнения контекста
+        logger.info(f"[LLM] llama.cpp response HTTP {resp.status_code} in {dt:.2f}s")
+
         if resp.status_code == 400 and (
             "exceed_context_size_error" in text_body
             or "exceeds the available context size" in text_body
@@ -71,21 +70,14 @@ class LlamaCppClient(BaseLLMClient):
                 f"Unexpected llama.cpp response format: {e}, body={data}"
             )
 
-        return content, t1 - t0
+        return content, dt
 
 
 @dataclass
 class OllamaClient(BaseLLMClient):
-    """
-    Клиент для Ollama /api/generate.
-
-    По контракту тоже предоставляет:
-        translate(system_prompt, user_prompt) -> (text, dt_seconds)
-    """
-
     url: str
     model: str
-    timeout: int = 600
+    timeout: int = 60
     options: Dict[str, Any] | None = None
 
     def translate(self, system_prompt: str, user_prompt: str) -> Tuple[str, float]:
@@ -100,9 +92,17 @@ class OllamaClient(BaseLLMClient):
             "stream": False,
         }
 
+        logger.info(
+            f"[LLM] Ollama call → {self.url} model={self.model}, "
+            f"user_prompt_len={len(user_prompt)}"
+        )
+
         t0 = time.time()
         resp = requests.post(self.url, json=payload, timeout=self.timeout)
         t1 = time.time()
+
+        dt = t1 - t0
+        logger.info(f"[LLM] Ollama response HTTP {resp.status_code} in {dt:.2f}s")
 
         if resp.status_code != 200:
             raise RuntimeError(
@@ -117,4 +117,4 @@ class OllamaClient(BaseLLMClient):
                 f"Unexpected Ollama response format: {e}, body={data}"
             )
 
-        return content, t1 - t0
+        return content, dt

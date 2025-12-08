@@ -1,121 +1,124 @@
-# Translation System Context (MVP: Java + Strings)
+# Translation System – Functional Requirements (MVP: Java + Strings)
 
-## Goal
+Language: EN (token-efficient, compact).
 
-Offline translation of source projects using local LLM (llama.cpp / Ollama) with:
-- strict code syntax preservation
-- translation of human-facing text only
-- safety checks against hallucinations and API-like junk
+## 1. Scope
 
-MVP: support
-- single-string translation (sanity test)
-- Java source files: translate string literals and comments only
+- Offline, deterministic translation for source projects using local LLM.
+- MVP covers:
+  - Java files (`.java`): translate comments + string literals only.
+  - Simple string translation (used by sanity tests and future APIs).
+- Backends:
+  - llama.cpp via `/v1/chat/completions`.
+  - Ollama via `/api/generate`.
 
-## High-Level Flow
+## 2. High-level flow
 
-1. CLI (`translate_project.py`):
-   - parse args (backend, model, langs, paths, workers)
-   - init logging, stats, glossary path
-   - init LLM client (`LlamaCppClient` or `OllamaClient`)
-   - build `StringTranslator` for string-level translation
-   - scan project files (`rglob`)
-   - for each file call `process_file(rel_path, ...)` in thread pool
-   - at end: log stats + summary + sanity check results
+1. CLI (`translate_project.py`) parses args.
+2. Orchestrator:
+   - Prepares input dir (unzip if `.zip`).
+   - Creates output dir and logger.
+   - Builds LLM client, Stats, StringTranslator, JavaTranslator.
+   - Enumerates all files under input root (relative paths).
+   - For each file, calls File Router.
+   - Shows progress (tqdm if TTY).
+3. File Router:
+   - Decides how to handle file:
+     - `.java` → JavaTranslator.
+     - Other text / binary → copy as-is (for MVP).
+   - Handles all IO, resume logic and error recording.
+4. Translators work in memory only:
+   - JavaTranslator: text → text, no disk access.
+   - StringTranslator: short text → short text, with cache + stats.
+5. At the end, Stats summary is logged.
 
-2. File pipeline (`translate_project.py` or `core/file_pipeline.py`):
-   - decide destination path:
-     - default: `dst_root / rel_path`
-     - HTML later: `dst_root / rel_path.parent / "en" / rel_path.name`
-   - RESUME: if dest exists → skip
-   - choose module by extension:
-     - `.java` → `java_translator.translate_text(...)`
-     - later: `.html`, `.json`, `.yaml`, `.properties`, generic text
-   - read source file as UTF-8 text
-   - call selected module (pure text→text)
-   - write result to destination (UTF-8)
-   - update `Stats` (files, chars, words, llm_time)
+## 3. Translation rules (MVP)
 
-3. LLM clients (`core/llm_client.py`):
-   - `BaseLLMClient`:
-     - `translate(system_prompt: str, user_prompt: str) -> tuple[str, float]`
-   - `LlamaCppClient`:
-     - endpoint: `/v1/chat/completions` (OpenAI-compatible)
-     - handles HTTP errors
-     - detects context limit errors and raises `ExceedContextSizeError`
-   - `OllamaClient`:
-     - endpoint: `/api/generate`
-     - supports `options` (e.g. `num_ctx`, `temperature`, etc.)
+### 3.1 Java files
 
-4. String-level translation (`core/string_translator.py`):
-   - `class StringTranslator`:
-     - fields: `client`, `source_lang`, `target_lang`, `stats`, `cache`, `system_prompt`, `glossary_path`
-     - `translate_string(s: str) -> str`:
-       - if in cache → return
-       - heuristic `is_human_visible_string(s)`:
-         - skip i18n-like keys
-         - skip bare paths
-         - prefer strings with spaces or punctuation
-       - build user prompt:
-         - strict: “Translate ONLY this string, no comments or explanations”
-       - call `client.translate(system_prompt, user_prompt)`
-       - update `stats` (chars, words, llm_time)
-       - strip outer quotes if модель их добавила
-       - cache result
-       - append pair to `glossary_suggestions.tsv`
-   - system prompt:
-     - strict technical translator
-     - do not change identifiers, keys, URLs, placeholders, escapes
-     - keep backslashes exactly
-     - no explanations
+- Input: full `.java` file text (UTF-8).
+- Output: same file structure; only comments and string literals translated.
+- Must preserve:
+  - Package / import / class / method structure.
+  - All code tokens and syntax.
+  - Char literals (`'a'`, `'\n'`, etc.).
+  - Indentation and line breaks (best effort).
+- Translate:
+  - Line comments: `// ...`.
+  - Block comments: `/* ... */`, `/** ... */`.
+  - String literals: `"..."` including multi-line with escapes.
+- Use StringTranslator for each comment/string payload.
 
-5. Java translation module (`java/java_translator.py`):
-   - pure function:
-     - `translate_text(text: str, string_translator: StringTranslator, logger) -> str`
-   - responsibilities:
-     - parse Java source linearly
-     - preserve all non-text syntax:
-       - keywords, identifiers, braces, operators, annotations, etc.
-     - detect zones to translate:
-       - string literals: `"..."` (Java classic strings)
-       - line comments: `// ...`
-       - block comments: `/* ... */` and Javadoc `/** ... */`
-     - do NOT translate:
-       - char literals: `'a'`, `'\n'`, etc.
-       - anything outside comments/strings
-     - for each zone:
-       - pass inner text to `string_translator.translate_string(...)`
-       - re-wrap with original delimiters:
-         - `"translated"` for strings
-         - `// translated` for line comments
-         - `/* translated */` for block/Javadoc comments
-   - no file IO, no path logic, no RESUME inside module.
+### 3.2 Strings (sanity, utilities)
 
-6. Sanity check (`sanity/sanity_runner.py`):
-   - uses public APIs only:
-     - `StringTranslator`
-     - `java_translator.translate_text`
-   - modes:
-     - `string_simple`:
-       - read `tests/sanity_check.txt`
-       - run through `StringTranslator`
-       - check:
-         - banned tokens: “OpenAI”, “API”, “Key improvements”, “The code now”, “Error generating text”
-         - sentence count ratio (e.g. > 3x → suspicious)
-     - `java_file`:
-       - read `tests/sanity_check.java`
-       - run through `java_translator.translate_text`
-       - parse orig vs translated:
-         - count string literals
-         - count comments
-         - compare simple “skeleton hash” (code without strings/comments)
-         - check banned tokens
-   - outputs JSON report like:
-     - status: `ok` / `fail`
-     - issues: list of codes + messages
-     - details: metrics (length, counts)
+- Input: raw string.
+- Output: translated string or original if not human-visible.
+- Heuristics:
+  - Skip obvious keys (no spaces, dot/underscore/dash pattern).
+  - Skip path-like tokens (`/`, `\`, no spaces).
+- Glossary:
+  - Each translated pair is appended to `glossary_suggestions.tsv`.
 
-7. QA / result map (later):
-   - aggregator builds JSON / HTML map of:
-     - file-level status
-     - sanity results
-     - stats per file and per project
+## 4. Concurrency and progress
+
+- ThreadPoolExecutor used with `--workers` threads.
+- Each worker:
+  - Logs start/end of file.
+  - Delegates work to File Router.
+- If stderr is a TTY:
+  - tqdm progress bar shows total files and current progress.
+- If not a TTY:
+  - Only logger output is used (no tqdm).
+
+## 5. Error handling
+
+- All file operations are wrapped in try/except in File Router.
+- On error:
+  - Increment `error_files`.
+  - Log error with full path.
+  - Append message into `Stats.errors`.
+- LLM errors:
+  - Handled inside LLM client; non-200 → RuntimeError.
+  - Context overflow → `ExceedContextSizeError` (detected in LLM client).
+- `translate_project.py` does not crash on single file failure.
+
+## 6. Resume behavior
+
+- Destination path is computed once per file.
+- If destination exists:
+  - File is counted as `skipped_files` and is not re-translated.
+- For `.java`:
+  - Only missing translation outputs are processed.
+- For non-text/binary:
+  - File is copied once; later runs skip.
+
+## 7. Logging
+
+- Single logger `translator` with:
+  - Console handler.
+  - File handler: `output/_translation_logs/translation.log`.
+- Key messages:
+  - Startup configuration (paths, backend, model, workers, langs).
+  - Discovered file count.
+  - Per file: `[FILE] Start:` / `[FILE] Done:`.
+  - LLM calls logged by `core.llm_client` (URL, model, latency).
+  - Final Stats summary + errors list.
+
+## 8. Sanity checks (target design, not yet wired for MVP)
+
+- Tests folder: `tests/` with:
+  - `sanity_check.txt` – simple string for single-string translation.
+  - `sanity_check.java` – representative Java file.
+- Sanity runner (future):
+  - Calls StringTranslator and JavaTranslator.
+  - Checks for banned tokens (e.g. "OpenAI", "API", "Key improvements", "The code now", "Error generating text").
+  - Compares sentence and structure ratios.
+  - Produces `sanity_report.json` with simple pass/fail and metrics.
+
+## 9. Outputs
+
+- Translated project tree under `--output`.
+- Logs under `--output/_translation_logs/`:
+  - `translation.log`.
+  - `glossary_suggestions.tsv`.
+- (Future) `sanity_report.json` and QA artifacts.

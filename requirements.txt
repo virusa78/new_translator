@@ -4,3 +4,5 @@ requests>=2.31.0
 # YAML-поддержка (на будущее, для JSON/YAML-модулей перевода)
 PyYAML>=6.0.1
 #pip install -r requirements.txt
+
+tqdm>=4.66.0
