@@ -187,7 +187,7 @@ def main() -> None:
             dst_root=output_root,
             rel_path=rel_path,
             java_translator=java_translator,
-            string_translator=string_translator,
+            #string_translator=string_translator,
             stats=stats,
             logger=logger,
         )

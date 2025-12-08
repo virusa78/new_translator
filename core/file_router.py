@@ -1,92 +1,109 @@
 # core/file_router.py
 from __future__ import annotations
 
-import logging
 import shutil
 from pathlib import Path
-
-from .stats import Stats
-from .string_translator import StringTranslator
-from java_translator import JavaTranslator  # локальный модуль рядом с translate_project.py
+from typing import Any
 
 
-__all__ = ["route_and_process_file"]
+JAVA_EXTENSIONS = {".java"}
+
+
+def ensure_parent_dir(path: Path) -> None:
+    """
+    Ensure that parent directory exists.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def route_and_process_file(
     src_root: Path,
     dst_root: Path,
     rel_path: Path,
-    *,
-    java_translator: JavaTranslator,
-    string_translator: StringTranslator,  # пока не используем, но оставляем для будущих типов
-    stats: Stats,
-    logger: logging.Logger,
-    verbose: bool = False,
+    java_translator: Any,
+    stats: Any,
+    logger: Any,
 ) -> None:
     """
-    Единая точка обработки одного файла.
+    Route a single file to the proper translation/copy logic and write result.
 
-    - Решает, надо ли файл переводить (сейчас только .java).
-    - Делает RESUME: если целевой файл уже есть – не трогаем.
-    - Отвечает за чтение/запись на диск и обновление статистики.
-    - Внутри вызывает только text→text переводчики (JavaTranslator и т.п.).
+    For MVP:
+    - .java → JavaTranslator.translate(text, file_label=...)
+    - другие файлы → просто копируем (skip/RESUME)
+
+    Atomic write:
+    - if src_size > 10 KB → write to tmp file and then os.replace
     """
     src_path = src_root / rel_path
     dst_path = dst_root / rel_path
 
     stats.total_files += 1
-    suffix = src_path.suffix.lower()
 
-    # --- RESUME -----------------------------------------------------------
+    # RESUME: если целевой файл уже существует — пропускаем
     if dst_path.exists():
+        logger.info(f"[RESUME] Skip already processed file: {rel_path}")
         stats.skipped_files += 1
-        if verbose:
-            logger.info(f"[RESUME] Skip already processed file: {rel_path}")
         return
 
-    try:
-        # ------------------------------------------------------------------
-        # 1) Java-файлы: гоняем через JavaTranslator (LLM дергается внутри)
-        # ------------------------------------------------------------------
-        if suffix == ".java":
-            logger.info(f"[FILE] Start JAVA: {rel_path}")
+    suffix = src_path.suffix.lower()
 
-            # читаем как текст
-            text = src_path.read_text(encoding="utf-8", errors="replace")
-
-            len_in = len(text)
-            translated = java_translator.translate(text, file_label=str(rel_path))
-            len_out = len(translated)
-
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
-            dst_path.write_text(translated, encoding="utf-8", newline="")
-
-            stats.translated_files += 1
-
-            if verbose:
-                logger.info(
-                    f"[FILE] Done JAVA: {rel_path} "
-                    f"(len_in={len_in}, len_out={len_out})"
-                )
+    # --- Java files: use JavaTranslationAgent ---
+    if suffix in JAVA_EXTENSIONS:
+        try:
+            text = src_path.read_text(encoding="utf-8")
+        except Exception as e:
+            msg = f"[ERROR] Read failed: {src_path}: {e}"
+            logger.error(msg, exc_info=True)
+            stats.error_files += 1
+            stats.errors.append(msg)
             return
 
-        # ------------------------------------------------------------------
-        # 2) MVP: всё остальное просто копируем как есть
-        #    (XML/JSON/HTML/etc будем подключать позже отдельными агентами)
-        # ------------------------------------------------------------------
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_path, dst_path)
-        stats.skipped_files += 1
+        logger.info(
+            f"[JAVA] Translating {rel_path} (len={len(text)} chars)"
+        )
 
-        if verbose:
-            logger.info(
-                f"[FILE] Copied without translation (suffix={suffix}): {rel_path}"
+        try:
+            translated = java_translator.translate(
+                text=text,
+                file_label=str(rel_path),  # for logging / future heuristics
             )
+        except Exception as e:
+            msg = f"[ERROR] Translate {src_path}: {e}"
+            logger.error(msg, exc_info=True)
+            stats.error_files += 1
+            stats.errors.append(msg)
+            return
 
+        # атомарная запись для файлов > 10 KB
+        try:
+            ensure_parent_dir(dst_path)
+            if len(text) > 10_000:
+                tmp_path = dst_path.with_suffix(dst_path.suffix + ".tmp")
+                tmp_path.write_text(translated, encoding="utf-8")
+                tmp_path.replace(dst_path)
+            else:
+                dst_path.write_text(translated, encoding="utf-8")
+
+            stats.translated_files += 1
+            stats.total_input_chars += len(text)
+            stats.total_output_chars += len(translated)
+            stats.total_words += len(translated.split())
+        except Exception as e:
+            msg = f"[ERROR] Write failed: {dst_path}: {e}"
+            logger.error(msg, exc_info=True)
+            stats.error_files += 1
+            stats.errors.append(msg)
+
+        return
+
+    # --- Non-Java: just copy (MVP) ---
+    try:
+        ensure_parent_dir(dst_path)
+        shutil.copy2(src_path, dst_path)
+        logger.info(f"[COPY] {rel_path}")
+        stats.skipped_files += 1
     except Exception as e:
+        msg = f"[ERROR] Copy {src_path} -> {dst_path}: {e}"
+        logger.error(msg, exc_info=True)
         stats.error_files += 1
-        msg = f"[ERROR] Translate {src_path}: {e}"
-        # В verbose режиме логируем stacktrace, в обычном — только сообщение
-        logger.error(msg, exc_info=verbose)
         stats.errors.append(msg)
